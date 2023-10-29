@@ -15,13 +15,15 @@ mod switch;
 mod task;
 
 use crate::config::MAX_APP_NUM;
+use crate::config::MAX_SYSCALL_NUM;
 use crate::loader::{get_num_app, init_app_cx};
 use crate::sync::UPSafeCell;
 use lazy_static::*;
 use switch::__switch;
-pub use task::{TaskControlBlock, TaskStatus};
+pub use task::{TaskControlBlock, TaskStatus, TaskInfo};
 
 pub use context::TaskContext;
+use crate::timer::get_time_us;
 
 /// The task manager, where all the tasks are managed.
 ///
@@ -54,10 +56,13 @@ lazy_static! {
         let mut tasks = [TaskControlBlock {
             task_cx: TaskContext::zero_init(),
             task_status: TaskStatus::UnInit,
+            task_info: TaskInfo::new(),
+            first_running_time: 0,
         }; MAX_APP_NUM];
         for (i, task) in tasks.iter_mut().enumerate() {
             task.task_cx = TaskContext::goto_restore(init_app_cx(i));
             task.task_status = TaskStatus::Ready;
+            task.task_info.set_status(TaskStatus::Ready);
         }
         TaskManager {
             num_app,
@@ -80,6 +85,8 @@ impl TaskManager {
         let mut inner = self.inner.exclusive_access();
         let task0 = &mut inner.tasks[0];
         task0.task_status = TaskStatus::Running;
+        task0.task_info.set_status(TaskStatus::Running);
+        task0.init_first_running_time(get_time());
         let next_task_cx_ptr = &task0.task_cx as *const TaskContext;
         drop(inner);
         let mut _unused = TaskContext::zero_init();
@@ -95,6 +102,7 @@ impl TaskManager {
         let mut inner = self.inner.exclusive_access();
         let current = inner.current_task;
         inner.tasks[current].task_status = TaskStatus::Ready;
+        inner.tasks[current].task_info.set_status(TaskStatus::Ready);
     }
 
     /// Change the status of current `Running` task into `Exited`.
@@ -102,6 +110,7 @@ impl TaskManager {
         let mut inner = self.inner.exclusive_access();
         let current = inner.current_task;
         inner.tasks[current].task_status = TaskStatus::Exited;
+        inner.tasks[current].task_info.set_status(TaskStatus::Exited);
     }
 
     /// Find next task to run and return task id.
@@ -122,6 +131,8 @@ impl TaskManager {
             let mut inner = self.inner.exclusive_access();
             let current = inner.current_task;
             inner.tasks[next].task_status = TaskStatus::Running;
+            inner.tasks[next].task_info.set_status(TaskStatus::Running);
+            inner.tasks[next].init_first_running_time(get_time());
             inner.current_task = next;
             let current_task_cx_ptr = &mut inner.tasks[current].task_cx as *mut TaskContext;
             let next_task_cx_ptr = &inner.tasks[next].task_cx as *const TaskContext;
@@ -134,6 +145,22 @@ impl TaskManager {
         } else {
             panic!("All applications completed!");
         }
+    }
+
+    // fn current_task_info
+    fn current_task_info(&self) -> TaskInfo {
+        let inner = self.inner.exclusive_access();
+        let task_start = inner.tasks[inner.current_task].first_running_time;
+        let mut task_info = inner.tasks[inner.current_task].task_info;
+        task_info.set_time(get_time() - task_start);
+        task_info
+    }
+
+    /// increment the current task system call counter
+    fn increment_current_task_system_call_count(&self, syscall_id: usize)  {
+        let mut inner = self.inner.exclusive_access(); 
+        let current = inner.current_task;
+        inner.tasks[current].task_info.inc_syscall_times(syscall_id); 
     }
 }
 
@@ -169,3 +196,20 @@ pub fn exit_current_and_run_next() {
     mark_current_exited();
     run_next_task();
 }
+/// Get task information of the current 'Running' task
+pub fn current_task_info(ti: *mut TaskInfo) {
+    unsafe {*ti = TASK_MANAGER.current_task_info()}
+}
+
+/// Update the system call counter of current 'Running' task
+pub fn inc_current_task_system_call_count(syscall_id: usize) {
+    if syscall_id < MAX_SYSCALL_NUM {
+        TASK_MANAGER.increment_current_task_system_call_count(syscall_id);
+    } 
+}
+/// get micro time
+pub fn get_time() -> usize {
+    let us = get_time_us();
+    us / 1000
+}
+
